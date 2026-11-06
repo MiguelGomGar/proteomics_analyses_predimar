@@ -1,0 +1,222 @@
+"""Correlation and collinearity diagnostics."""
+
+import numpy as np
+import pandas as pd
+import scipy.stats as stats
+import statsmodels.api as sm
+
+from src.utils.dataframe_utils import get_categorical_columns
+
+
+def compute_num_corr_matrix(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute Spearman correlation matrix for all numeric columns.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input dataframe.
+
+    Returns
+    -------
+    pd.DataFrame
+        Square correlation matrix (numeric columns only) using Spearman's rho.
+        Returns empty DataFrame if no numeric columns are found.
+    """
+    numeric_df = df.select_dtypes(include=[np.number])
+    if numeric_df.empty:
+        return pd.DataFrame()
+    return numeric_df.corr(method="spearman")
+
+
+def _compute_cramers_v(x: pd.Series, y: pd.Series) -> float:
+    """Compute Cramér's V statistic for association between two categorical variables.
+
+    Parameters
+    ----------
+    x : pd.Series
+        First categorical variable.
+    y : pd.Series
+        Second categorical variable.
+
+    Returns
+    -------
+    float
+        Cramér's V statistic (0-1, where 1 indicates perfect association).
+        Returns 0.0 if contingency table is empty or singular.
+    """
+    contingency_table = pd.crosstab(x, y)
+    n_samples = contingency_table.to_numpy().sum()
+    n_rows, n_cols = contingency_table.shape
+
+    if n_samples == 0 or min(n_rows - 1, n_cols - 1) == 0:
+        return 0.0
+
+    try:
+        chi2, _, _, _ = stats.chi2_contingency(contingency_table, correction=False)
+    except Exception:
+        return 0.0
+
+    v_value = np.sqrt(chi2 / (n_samples * min(n_rows - 1, n_cols - 1)))
+    return float(v_value)
+
+
+def compute_cat_corr_matrix(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute Cramér's V correlation matrix for all categorical columns.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input dataframe with at least 2 categorical columns.
+
+    Returns
+    -------
+    pd.DataFrame
+        Square matrix of Cramér's V values (0-1) for all categorical column
+        pairs, with the diagonal set to 1.0.
+
+    Raises
+    ------
+    ValueError
+        If the dataframe contains fewer than 2 categorical columns.
+    """
+    cat_df = df[get_categorical_columns(df)]
+    feature_names = list(cat_df.columns)
+    n_features = len(feature_names)
+
+    if n_features < 2:
+        raise ValueError(
+            "The provided dataframe must contain at least 2 categorical columns."
+        )
+
+    # Initialize a symmetric matrix filled with 1.0 on the diagonal
+    corr_matrix = pd.DataFrame(1.0, index=feature_names, columns=feature_names)
+
+    # Automate pairwise extraction using nested loops
+    for i in range(n_features - 1):
+        for j in range(i + 1, n_features):
+            col_i = feature_names[i]
+            col_j = feature_names[j]
+            association_score = _compute_cramers_v(cat_df[col_i], cat_df[col_j])
+            corr_matrix.loc[col_i, col_j] = association_score
+            corr_matrix.loc[col_j, col_i] = association_score
+
+    return corr_matrix
+
+
+def compute_vif_data(
+    df: pd.DataFrame, threshold: float = 5.0, target_var: str = "AF_recurrence"
+) -> pd.Series | None:
+    """Compute Variance Inflation Factor (VIF) / Generalized VIF for each feature.
+
+    Calculates VIF for numeric features and Generalized VIF (GVIF) for
+    categorical features using OLS regression on the correlation matrix.
+    Handles missing values and invariant features automatically.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input dataframe with mixed numeric and categorical columns.
+    threshold : float, default 5.0
+        VIF threshold for flagging collinearity (for reference only, not used
+        to filter output).
+    target_var : str, default "AF_recurrence"
+        Name of the target/outcome column to exclude from VIF computation.
+
+    Returns
+    -------
+    pd.Series or None
+        VIF/GVIF per feature, sorted in descending order. Index is feature
+        names, values are VIF. Returns None if no complete cases available.
+    """
+    # The target is excluded up front: VIF describes the mutual dependency
+    # between predictors only, so the outcome must not constrain the set of
+    # complete cases nor be coerced to a numeric dtype.
+    temp_data = df.drop(columns=[target_var], errors="ignore").copy()
+
+    complete_cases_subset = temp_data.dropna()
+
+    single_level_features = [
+        col for col in complete_cases_subset.columns
+        if complete_cases_subset[col].nunique() < 2
+    ]
+
+    if single_level_features:
+        print(
+            f"\n[VIF Diagnostics] Automatically dropping columns that become invariant within complete cases:\n{', '.join(single_level_features)}\n"
+        )
+        temp_data = temp_data.drop(columns=single_level_features)
+
+    X_df = temp_data.dropna()
+
+    if X_df.empty:
+        print("Warning: No complete cases available for VIF calculation.")
+        return None
+
+    feature_groups = {}
+    encoded_dfs = []
+
+    for col in X_df.columns:
+        if X_df[col].dtype.name in ["category", "object", "bool"] or not np.issubdtype(
+            X_df[col].dtype, np.number
+        ):
+            dummies = pd.get_dummies(
+                X_df[col], prefix=col, drop_first=True, dtype=float
+            )
+            feature_groups[col] = list(dummies.columns)
+            encoded_dfs.append(dummies)
+        else:
+            feature_groups[col] = [col]
+            encoded_dfs.append(X_df[[col]].astype(float))
+
+    X_encoded = pd.concat(encoded_dfs, axis=1)
+    corr_all = X_encoded.corr().to_numpy()
+    cols_all = list(X_encoded.columns)
+
+    vif_dict = {}
+    for col, group in feature_groups.items():
+        if not group:
+            continue
+        idx_other = [i for i, c in enumerate(cols_all) if c not in group]
+
+        if not idx_other:
+            vif_dict[col] = 1.0
+            continue
+
+        if len(group) == 1:
+            dep = group[0]
+            indep = [c for c in cols_all if c != dep]
+            try:
+                X_indep = sm.add_constant(X_encoded[indep])
+                model = sm.OLS(X_encoded[dep], X_indep).fit()
+                r2 = model.rsquared
+                vif = 1.0 / (1.0 - r2) if r2 < 1.0 else 999.0
+            except Exception:
+                vif = 1.0
+            vif_dict[col] = vif
+        else:
+            try:
+                R_group = X_encoded[group].corr().to_numpy()
+                other_cols = [cols_all[i] for i in idx_other]
+                R_other = X_encoded[other_cols].corr().to_numpy()
+
+                det_group = np.linalg.det(R_group)
+                det_other = np.linalg.det(R_other)
+                det_all = np.linalg.det(corr_all)
+
+                if det_all == 0 or np.isnan(det_all):
+                    ridge = 1e-5 * np.eye(corr_all.shape[0])
+                    det_all = np.linalg.det(corr_all + ridge)
+                    det_group = np.linalg.det(R_group + 1e-5 * np.eye(R_group.shape[0]))
+                    det_other = np.linalg.det(R_other + 1e-5 * np.eye(R_other.shape[0]))
+                gvif = (det_group * det_other) / det_all if det_all != 0 else 1.0
+                # Fox & Monette (1992): GVIF must be rescaled by its degrees of
+                # freedom to be comparable across features. GVIF^(1/(2*df)) is
+                # on the scale of sqrt(VIF), so its square, GVIF^(1/df), is on
+                # the scale of VIF and can be compared against the same
+                # threshold used for numeric features.
+                dof = len(group)
+                vif_dict[col] = float(abs(gvif) ** (1.0 / dof))
+            except Exception:
+                vif_dict[col] = 1.0
+
+    return pd.Series(vif_dict).sort_values(ascending=False)

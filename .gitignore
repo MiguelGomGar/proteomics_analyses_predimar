@@ -1,0 +1,45 @@
+# ========================
+# DATA & RESULTS
+# ========================
+/data/
+/results/
+
+# ========================
+# LOGS
+# ========================
+/logs/
+
+# ========================
+# PYTHON & JUPYTER
+# ========================
+.ipynb_checkpoints/
+__pycache__/
+*.pyc
+
+# ========================
+# IDE & OS
+# ========================
+/.vscode/
+Thumbs.db
+.positai
+
+# ========================
+# CODESPACES & ORYX
+# ========================
+venv/
+oryx-build-commands.txt
+.oryx/
+/.devcontainer/
+
+# ========================
+# DOCUMENTS
+# ========================
+/literature/
+*.docx
+*.tmp
+*.md
+!CLAUDE.md
+!README.md
+!/docs/**/*.md
+/.claude/
+*.pptx
